@@ -2,48 +2,97 @@
 
 #![cfg(not(feature = "no-entrypoint"))]
 
-use {
-    solana_program::{
-        account_info::AccountInfo,
-        entrypoint::{ProgramResult, HEAP_LENGTH, HEAP_START_ADDRESS},
-        pubkey::Pubkey,
-    },
-    std::{alloc::Layout, mem::size_of, ptr::null_mut, usize},
-};
-
-/// Developers can implement their own heap by defining their own
-/// `#[global_allocator]`.  The following implements a dummy for test purposes
-/// but can be flushed out with whatever the developer sees fit.
-struct BumpAllocator;
-unsafe impl std::alloc::GlobalAlloc for BumpAllocator {
-    #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        const POS_PTR: *mut usize = HEAP_START_ADDRESS as usize as *mut usize;
-        const TOP_ADDRESS: usize = HEAP_START_ADDRESS as usize + HEAP_LENGTH;
-        const BOTTOM_ADDRESS: usize = HEAP_START_ADDRESS as usize + size_of::<*mut u8>();
-
-        let mut pos = *POS_PTR;
-        if pos == 0 {
-            // First time, set starting position
-            pos = TOP_ADDRESS;
-        }
-        pos = pos.saturating_sub(layout.size());
-        pos &= !(layout.align().saturating_sub(1));
-        if pos < BOTTOM_ADDRESS {
-            return null_mut();
-        }
-        *POS_PTR = pos;
-        pos as *mut u8
-    }
-    #[inline]
-    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {
-        // I'm a bump allocator, I don't free
-    }
-}
+use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
 
 #[cfg(target_os = "solana")]
-#[global_allocator]
-static A: BumpAllocator = BumpAllocator;
+mod custom_allocator {
+    use core::mem::align_of;
+    use linked_list_allocator::Heap;
+    use solana_program::entrypoint::HEAP_LENGTH;
+    use solana_program::msg;
+    use static_assertions::const_assert_eq;
+    use std::alloc::Layout;
+    use std::mem::size_of;
+    use std::ptr::NonNull;
+
+    const HEAP_START_ADDRESS: usize = 0x300000000;
+    const_assert_eq!(HEAP_START_ADDRESS % align_of::<Heap>(), 0);
+
+    const HEAP_PTR: *mut Heap = HEAP_START_ADDRESS as *mut Heap;
+
+    fn heap() -> &'static mut Heap {
+        // This is legal since all-zero is a valid `Heap`-struct representation
+        let heap = unsafe { &mut *HEAP_PTR };
+
+        if heap.bottom().is_null() {
+            let start = (HEAP_START_ADDRESS + size_of::<Heap>()) as *mut u8;
+            let size = HEAP_LENGTH - size_of::<Heap>();
+            unsafe { heap.init(start, size) };
+        }
+
+        heap
+    }
+
+    pub struct SolanaAllocator;
+
+    unsafe impl std::alloc::GlobalAlloc for SolanaAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            msg!("alloc");
+
+            #[allow(clippy::option_if_let_else)]
+            if let Ok(non_null) = heap().allocate_first_fit(layout) {
+                non_null.as_ptr()
+            } else {
+                solana_program::log::sol_log("EVM Allocator out of memory");
+                std::ptr::null_mut()
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            msg!("dealloc");
+
+            heap().deallocate(NonNull::new_unchecked(ptr), layout);
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            msg!("alloc_zeroed");
+
+            let ptr = self.alloc(layout);
+
+            if !ptr.is_null() {
+                #[cfg(target_os = "solana")]
+                solana_program::syscalls::sol_memset_(ptr, 0, layout.size() as u64);
+                #[cfg(not(target_os = "solana"))]
+                std::ptr::write_bytes(ptr, 0, layout.size());
+            }
+
+            ptr
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            msg!("realloc");
+
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let new_ptr = self.alloc(new_layout);
+
+            if !new_ptr.is_null() {
+                let copy_bytes = std::cmp::min(layout.size(), new_size);
+
+                #[cfg(target_os = "solana")]
+                solana_program::syscalls::sol_memcpy_(new_ptr, ptr, copy_bytes as u64);
+                #[cfg(not(target_os = "solana"))]
+                std::ptr::copy_nonoverlapping(ptr, new_ptr, copy_bytes);
+
+                self.dealloc(ptr, layout);
+            }
+
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: SolanaAllocator = SolanaAllocator;
+}
 
 solana_program::entrypoint!(process_instruction);
 fn process_instruction(

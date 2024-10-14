@@ -43,7 +43,7 @@ async fn success_initialize() {
 
     let update_authority = Pubkey::new_unique();
     let name = "MySuperCoolToken".to_string();
-    let symbol = "MINE".to_string();
+    let symbol = "❤️‍🔥".to_string();
     let uri = "my.super.cool.token".to_string();
     let token_metadata = TokenMetadata {
         name,
